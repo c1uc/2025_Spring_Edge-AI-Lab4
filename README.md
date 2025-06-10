@@ -3,5 +3,5 @@
 Deploy with calibration data
 
 ```
-python export_with_calib.py --precision w8a8 --calib_data_dir ./LaMa_test_images/ --target-runtime onnx
+python export_with_calib.py --precision w8a16 --calib_data_dir ./LaMa_test_images/ --target-runtime precompiled_qnn_onnx
 ```
