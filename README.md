@@ -11,7 +11,7 @@ https://drive.google.com/file/d/1rYwAJN_1PdomhxwgnrSu94fYxfFEDvdl/view?usp=shari
 
 2. Open the `android` folder in Android Studio (Version 2023.1.1 or newer)
 
-3. Build &rarr; Generate Signed App Bundle or APK...
+3. In Android Studio: Build &rarr; Generate Signed App Bundle or APK...
 
 You may want to check this link if you need further modification:
 
