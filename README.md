@@ -1,7 +1,11 @@
 # 2025_Spring_Edge-AI-Lab4
 
-Deploy with calibration data
+The Superresolution app adapt from qai-hub-app without NPU support (only CPU+GPU)
 
-```
-python export_with_calib.py --precision w8a8 --calib_data_dir ./LaMa_test_images/ --target-runtime onnx
-```
+### Download the app
+https://drive.google.com/file/d/1rYwAJN_1PdomhxwgnrSu94fYxfFEDvdl/view?usp=sharing
+
+### Build from source code
+Open the android folder in android studio
+
+Build &rarr; Generate Signed App Bundle or APK...
