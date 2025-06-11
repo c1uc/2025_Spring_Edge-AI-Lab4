@@ -1,354 +1,298 @@
-from __future__ import annotations
-import jinja2
+#!/usr/bin/env python3
+"""
+Script to export quantized LaMa model from AMP process to QAI Hub for compilation and profiling.
+This script adapts the export.py workflow to work with the quantized ONNX model output from aimet-amp.py.
+"""
+
 import os
 import warnings
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Optional, cast, Any
+import logging
 
 import qai_hub as hub
+import onnx
 import torch
-from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-import torchvision.transforms as T
-from datasets import load_dataset
-import itertools
+import numpy as np
 
 from qai_hub_models.models.common import ExportResult, Precision, TargetRuntime
 from qai_hub_models.models.lama_dilated import Model
-from qai_hub_models.utils import quantization as quantization_utils
-from qai_hub_models.utils.args import (
-    export_parser,
-    get_input_spec_kwargs,
-    get_model_kwargs,
-    validate_precision_runtime,
-)
-from qai_hub_models.utils.compare import torch_inference
 from qai_hub_models.utils.input_spec import make_torch_inputs
 from qai_hub_models.utils.printing import (
     print_inference_metrics,
     print_on_target_demo_cmd,
     print_profile_metrics_from_job,
 )
-from qai_hub_models.utils.qai_hub_helpers import (
-    can_access_qualcomm_ai_hub,
-    export_without_hub_access,
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
 )
+logger = logging.getLogger(__name__)
 
-def indent_except_first(s, width=4):
-    lines = s.splitlines()
-    if not lines:
-        return ''
-    first, rest = lines[0], lines[1:]
-    indent_str = ' ' * width
-    return '\n'.join([first] + [indent_str + line for line in rest])
 
-jinja2.filters.FILTERS['indent_except_first'] = indent_except_first
-
-os.environ["TORCHINDUCTOR_DISABLE"] = "1"
-os.environ["TORCHDYNAMO_DISABLE"] = "1"
-
-# class LocalImageCalibDataset(Dataset):
-#     def __init__(self, folder_path: str, transform=None):
-#         self.folder_path = folder_path
-#         self.transform = transform or T.Compose([
-#             T.Resize((256, 256)),
-#             T.ToTensor(),
-#         ])
-#         self.image_files = sorted([
-#             f for f in os.listdir(folder_path)
-#             if f.endswith(".png") and not f.endswith("_mask.png")
-#         ])
-
-#     def __len__(self):
-#         return len(self.image_files)
-
-#     def __getitem__(self, idx):
-#         img_path = os.path.join(self.folder_path, self.image_files[idx])
-#         img = Image.open(img_path).convert("RGB")
-#         return self.transform(img).unsqueeze(0)
-
-class LocalImageCalibDataset(Dataset):
-    def __init__(self, folder_path: str, transform=None):
-        self.folder_path = folder_path
-        self.transform = transform or T.Compose([
-            T.Resize((512, 512)),
-            T.ToTensor(),
-        ])
-        self.image_files = sorted([
-            f for f in os.listdir(folder_path)
-            if f.endswith(".png") and not f.endswith("_mask.png")
-        ])
-
-    def __len__(self):
-        return len(self.image_files)
-
-    def __getitem__(self, idx):
-        image_filename = self.image_files[idx]
-        mask_filename = image_filename.replace(".png", "_mask.png")
-
-        image_path = os.path.join(self.folder_path, image_filename)
-        mask_path = os.path.join(self.folder_path, mask_filename)
-
-        image = Image.open(image_path).convert("RGB")
-        mask = Image.open(mask_path).convert("L")
-
-        image_tensor = self.transform(image)
-        mask_tensor = self.transform(mask)
-
-        return {"image": image_tensor, "mask": mask_tensor}
-
-        calib_loader = DataLoader(dataset, batch_size=1)
-
-        input_keys = list(input_spec.keys())
-        calib_tensors_dict = {key: [] for key in input_keys}
-
-        for i, batch in enumerate(itertools.islice(iter(calib_loader), num_calibration_samples)):
-            try:
-                if isinstance(batch, dict):
-                    for k in input_keys:
-                        val = batch[k]
-                        assert isinstance(val, torch.Tensor), f"{k} at index {i} is not Tensor"
-                        calib_tensors_dict[k].append(val)
-                elif isinstance(batch, (list, tuple)) and len(input_keys) > 1:
-                    assert len(batch) == len(input_keys), f"Batch {i} size mismatch with input_keys"
-                    for k, val in zip(input_keys, batch):
-                        assert isinstance(val, torch.Tensor), f"{k} at index {i} is not Tensor"
-                        calib_tensors_dict[k].append(val)
-                else:
-                    k = input_keys[0]
-                    val = batch if not isinstance(batch, (list, tuple)) else batch[0]
-                    assert isinstance(val, torch.Tensor), f"{k} at index {i} is not Tensor"
-                    calib_tensors_dict[k].append(val)
-            except Exception as e:
-                print(f"[Warning] Skipping sample {i}: {e}")
-
-        lengths = [len(v) for v in calib_tensors_dict.values()]
-        assert len(set(lengths)) == 1, f"Inconsistent calibration sample counts: {lengths}"
-
-        calibration_data = calib_tensors_dict
-
-        quantize_job = hub.submit_quantize_job(
-            model=onnx_compile_job.get_target_model(),
-            calibration_data=calibration_data,
-            activations_dtype=precision.activations_type,
-            weights_dtype=precision.weights_type,
-            name=model_name,
-            options=model.get_hub_quantize_options(precision),
-        )
-
-class HFCalibDataset(Dataset):
-    def __init__(self, hf_name: str, split: str = "train", transform=None):
-        self.dataset = load_dataset(hf_name, split=split)
-        self.transform = transform or T.Compose([
-            T.Resize((256, 256)),
-            T.ToTensor(),
-        ])
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        img = self.dataset[idx]["image"]
-        return self.transform(img).unsqueeze(0)
-
-def export_model(
+def export_quantized_model(
+    quantized_model_path: str,
     device: Optional[str] = None,
     chipset: Optional[str] = None,
-    precision: Precision = Precision.float,
-    num_calibration_samples: int | None = None,
-    skip_compiling: bool = False,
     skip_profiling: bool = False,
     skip_inferencing: bool = False,
     skip_downloading: bool = False,
     skip_summary: bool = False,
     output_dir: Optional[str] = None,
-    target_runtime: TargetRuntime = TargetRuntime.TFLITE,
+    target_runtime: TargetRuntime = TargetRuntime.QNN,
     compile_options: str = "",
     profile_options: str = "",
-    fetch_static_assets: bool = False,
-    calib_data_dir: Optional[str] = None,
-    calib_hf_dataset: Optional[str] = None,
-    **additional_model_kwargs,
-) -> ExportResult | list[str]:
-    model_name = "lama_dilated"
+) -> ExportResult:
+    """
+    Export quantized ONNX model to QAI Hub for compilation and profiling.
+    
+    Parameters:
+        quantized_model_path: Path to the quantized ONNX model from AMP process
+        device: Device for which to export the model
+        chipset: If set, will choose a random device with this chipset
+        skip_profiling: If set, skips profiling of compiled model on real devices
+        skip_inferencing: If set, skips computing on-device outputs from sample data
+        skip_downloading: If set, skips downloading of compiled model
+        skip_summary: If set, skips waiting for and summarizing results
+        output_dir: Directory to store generated assets
+        target_runtime: Which on-device runtime to target
+        compile_options: Additional options to pass when submitting the compile job
+        profile_options: Additional options to pass when submitting the profile job
+        
+    Returns:
+        ExportResult containing job metadata
+    """
+    model_name = "lama_mixed_precision"
     output_path = Path(output_dir or Path.cwd() / "build" / model_name)
-    hub_device = hub.Device(
-        name=device or "", attributes=f"chipset:{chipset}" if chipset else []
-    ) if device or chipset else hub.Device("Samsung Galaxy S24 (Family)")
-
-    if fetch_static_assets or not can_access_qualcomm_ai_hub():
-        return export_without_hub_access(
-            model_name,
-            "LaMa-Dilated",
-            hub_device.name or f"Device (Chipset {chipset})",
-            skip_profiling,
-            skip_inferencing,
-            skip_downloading,
-            skip_summary,
-            output_path,
-            target_runtime,
-            precision,
-            compile_options,
-            profile_options,
-            is_forced_static_asset_fetch=fetch_static_assets,
+    
+    # Setup device
+    if not device and not chipset:
+        hub_device = hub.Device("Samsung Galaxy S24 (Family)")
+        logger.info("Using default device: Samsung Galaxy S24")
+    else:
+        hub_device = hub.Device(
+            name=device or "", attributes=f"chipset:{chipset}" if chipset else []
         )
-
-    use_channel_last_format = target_runtime.channel_last_native_execution
-
-    model = Model.from_pretrained(**get_model_kwargs(Model, additional_model_kwargs))
-    input_spec = model.get_input_spec(
-        **get_input_spec_kwargs(model, additional_model_kwargs)
-    )
-
-    quantize_job = None
-    if precision != Precision.float:
-        source_model = torch.jit.trace(model.to("cpu"), make_torch_inputs(input_spec))
-        print(f"Quantizing model {model_name}.")
-        onnx_compile_job = hub.submit_compile_job(
-            model=source_model,
-            input_specs=input_spec,
-            device=hub_device,
-            name=model_name,
-            options="--target_runtime onnx",
-        )
-
-        if not precision.activations_type or not precision.weights_type:
-            raise ValueError("Quantization is only supported if both weights and activations are quantized.")
-
-        if calib_data_dir:
-            dataset = LocalImageCalibDataset(calib_data_dir)
-        elif calib_hf_dataset:
-            dataset = HFCalibDataset(calib_hf_dataset)
-        else:
-            dataset = quantization_utils.get_calibration_data(model, input_spec, num_calibration_samples)
-
-        calib_loader = DataLoader(dataset, batch_size=1)
-        # input_key = input_spec.get_input_names()[0]
-        input_keys = list(input_spec.keys())
-        calib_tensors_dict = {key: [] for key in input_keys}
-
-        for batch in itertools.islice(iter(calib_loader), num_calibration_samples):
-            if isinstance(batch, dict):
-                for k in input_keys:
-                    calib_tensors_dict[k].append(batch[k])
-            elif isinstance(batch, (list, tuple)) and len(input_keys) > 1:
-                for k, img in zip(input_keys, batch):
-                    calib_tensors_dict[k].append(img)
-            else:
-                k = input_keys[0]
-                img = batch if not isinstance(batch, (list, tuple)) else batch[0]
-                calib_tensors_dict[k].append(img)
-
-        for key in calib_tensors_dict.keys():
-            print(f"Calibration data for {key}: {len(calib_tensors_dict[key])} samples")
-        calibration_data = calib_tensors_dict
-
-        quantize_job = hub.submit_quantize_job(
-            model=onnx_compile_job.get_target_model(),
-            calibration_data=calibration_data,
-            activations_dtype=precision.activations_type,
-            weights_dtype=precision.weights_type,
-            name=model_name,
-            options=model.get_hub_quantize_options(precision),
-        )
-        if skip_compiling:
-            return ExportResult(quantize_job=quantize_job)
-
-    source_model = quantize_job.get_target_model() if quantize_job else torch.jit.trace(model.to("cpu"), make_torch_inputs(input_spec))
-    model_compile_options = model.get_hub_compile_options(target_runtime, precision, compile_options, hub_device)
-    print(f"Optimizing model {model_name} to run on-device")
-    compile_job = cast(hub.client.CompileJob, hub.submit_compile_job(
-        model=source_model,
+        logger.info(f"Using device: {hub_device.name}")
+    
+    # Load the quantized ONNX model
+    logger.info(f"Loading quantized ONNX model from {quantized_model_path}")
+    if not os.path.exists(quantized_model_path):
+        raise FileNotFoundError(f"Quantized model not found at {quantized_model_path}")
+    
+    # Load ONNX model
+    onnx_model = onnx.load(quantized_model_path)
+    
+    # Get input specification from the original model class
+    logger.info("Getting input specifications...")
+    original_model = Model.from_pretrained()
+    input_spec = original_model.get_input_spec()
+    
+    # Compile options for quantized model
+    model_compile_options = f"--target_runtime {target_runtime.name.lower()}"
+    if compile_options:
+        model_compile_options += f" {compile_options}"
+    
+    logger.info(f"Compiling quantized model {model_name} for {target_runtime.name}")
+    logger.info(f"Compile options: {model_compile_options}")
+    
+    # Submit compile job
+    submitted_compile_job = hub.submit_compile_job(
+        model=onnx_model,
         input_specs=input_spec,
         device=hub_device,
         name=model_name,
         options=model_compile_options,
-    ))
-
+    )
+    compile_job = cast(hub.client.CompileJob, submitted_compile_job)
+    
+    # Profile the model performance on a real device
     profile_job: Optional[hub.client.ProfileJob] = None
     if not skip_profiling:
-        profile_options_all = model.get_hub_profile_options(target_runtime, profile_options)
-        print(f"Profiling model {model_name} on a hosted device.")
-        profile_job = cast(hub.client.ProfileJob, hub.submit_profile_job(
+        profile_options_all = profile_options
+        logger.info(f"Profiling quantized model {model_name} on device {hub_device.name}")
+        submitted_profile_job = hub.submit_profile_job(
             model=compile_job.get_target_model(),
             device=hub_device,
             name=model_name,
             options=profile_options_all,
-        ))
-
+        )
+        profile_job = cast(hub.client.ProfileJob, submitted_profile_job)
+    
+    # Run inference on sample inputs
     inference_job: Optional[hub.client.InferenceJob] = None
     if not skip_inferencing:
-        profile_options_all = model.get_hub_profile_options(target_runtime, profile_options)
-        print(f"Running inference for {model_name} on a hosted device with example inputs.")
-        sample_inputs = model.sample_inputs(input_spec, use_channel_last_format=use_channel_last_format)
-        inference_job = cast(hub.client.InferenceJob, hub.submit_inference_job(
+        logger.info(f"Running inference for quantized {model_name} on device")
+        
+        # Create sample inputs matching the LaMa model requirements
+        sample_inputs = original_model.sample_inputs(input_spec)
+        
+        submitted_inference_job = hub.submit_inference_job(
             model=compile_job.get_target_model(),
             inputs=sample_inputs,
             device=hub_device,
             name=model_name,
-            options=profile_options_all,
-        ))
-
+            options=profile_options,
+        )
+        inference_job = cast(hub.client.InferenceJob, submitted_inference_job)
+    
+    # Download the compiled model
     if not skip_downloading:
+        logger.info(f"Downloading compiled model to {output_path}")
         os.makedirs(output_path, exist_ok=True)
         target_model = compile_job.get_target_model()
         assert target_model is not None
         target_model.download(str(output_path / model_name))
-
+    
+    # Summarize results from profiling and inference
     if not skip_summary and profile_job is not None:
-        assert profile_job.wait().success, "Job failed: " + profile_job.url
+        logger.info("Waiting for profiling job to complete...")
+        assert profile_job.wait().success, "Profile job failed: " + profile_job.url
         profile_data: dict[str, Any] = profile_job.download_profile()
         print_profile_metrics_from_job(profile_job, profile_data)
-
+    
     if not skip_summary and inference_job is not None:
-        sample_inputs = model.sample_inputs(input_spec, use_channel_last_format=False)
-        torch_out = torch_inference(model, sample_inputs, return_channel_last_output=use_channel_last_format)
-        assert inference_job.wait().success, "Job failed: " + inference_job.url
+        logger.info("Waiting for inference job to complete...")
+        sample_inputs = original_model.sample_inputs(input_spec, use_channel_last_format=False)
+        
+        # Get reference outputs from original model
+        original_model.eval()
+        with torch.no_grad():
+            torch_out = original_model(*sample_inputs)
+        
+        assert inference_job.wait().success, "Inference job failed: " + inference_job.url
         inference_result = inference_job.download_output_data()
         assert inference_result is not None
-        print_inference_metrics(inference_job, inference_result, torch_out, model.get_output_names())
-
+        
+        print_inference_metrics(
+            inference_job, inference_result, torch_out, original_model.get_output_names()
+        )
+    
     if not skip_summary:
         print_on_target_demo_cmd(compile_job, Path(__file__).parent, hub_device)
-
+    
+    logger.info("Export to QAI Hub completed successfully!")
+    
     return ExportResult(
         compile_job=compile_job,
         inference_job=inference_job,
         profile_job=profile_job,
-        quantize_job=quantize_job,
+        quantize_job=None,  # Quantization was done by AMP
     )
 
-def main():
-    warnings.filterwarnings("ignore")
-    supported_precision_runtimes: dict[Precision, list[TargetRuntime]] = {
-        Precision.float: [
-            TargetRuntime.TFLITE,
-            TargetRuntime.QNN,
-            TargetRuntime.QNN_CONTEXT_BINARY,
-            TargetRuntime.ONNX,
-            TargetRuntime.PRECOMPILED_QNN_ONNX,
-        ],
-        Precision.w8a8: [
-            TargetRuntime.TFLITE,
-            TargetRuntime.QNN,
-            TargetRuntime.QNN_CONTEXT_BINARY,
-            TargetRuntime.ONNX,
-            TargetRuntime.PRECOMPILED_QNN_ONNX,
-        ],
-        Precision.w8a16: [
-            TargetRuntime.QNN,
-            TargetRuntime.QNN_CONTEXT_BINARY,
-            TargetRuntime.ONNX,
-            TargetRuntime.PRECOMPILED_QNN_ONNX,
-        ],
-    }
 
-    parser = export_parser(model_cls=Model, supported_precision_runtimes=supported_precision_runtimes)
-    parser.add_argument("--calib_data_dir", type=str, default=None, help="Path to calibration image folder")
-    parser.add_argument("--calib_hf_dataset", type=str, default=None, help="Hugging Face dataset name for calibration")
+def main():
+    """Main function to export quantized LaMa model to QAI Hub."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Export quantized LaMa model from AMP to QAI Hub"
+    )
+    parser.add_argument(
+        "--quantized-model",
+        type=str,
+        default="./output/lama_mixed_precision.onnx",
+        help="Path to quantized ONNX model from AMP process"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        help="Target device name for compilation and profiling"
+    )
+    parser.add_argument(
+        "--chipset",
+        type=str,
+        help="Target chipset (overrides device argument)"
+    )
+    parser.add_argument(
+        "--target-runtime",
+        type=str,
+        choices=["tflite", "qnn", "qnn_context_binary", "onnx", "precompiled_qnn_onnx"],
+        default="qnn",
+        help="Target runtime for compilation"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="./qai_hub_output",
+        help="Output directory for compiled model"
+    )
+    parser.add_argument(
+        "--skip-profiling",
+        action="store_true",
+        help="Skip profiling on device"
+    )
+    parser.add_argument(
+        "--skip-inferencing",
+        action="store_true",
+        help="Skip inference testing"
+    )
+    parser.add_argument(
+        "--skip-downloading",
+        action="store_true",
+        help="Skip downloading compiled model"
+    )
+    parser.add_argument(
+        "--compile-options",
+        type=str,
+        default="",
+        help="Additional compile options"
+    )
+    parser.add_argument(
+        "--profile-options",
+        type=str,
+        default="",
+        help="Additional profile options"
+    )
+    
     args = parser.parse_args()
-    validate_precision_runtime(supported_precision_runtimes, args.precision, args.target_runtime)
-    export_model(**vars(args))
+    
+    # Convert target runtime string to enum
+    target_runtime_map = {
+        "tflite": TargetRuntime.TFLITE,
+        "qnn": TargetRuntime.QNN,
+        "qnn_context_binary": TargetRuntime.QNN_CONTEXT_BINARY,
+        "onnx": TargetRuntime.ONNX,
+        "precompiled_qnn_onnx": TargetRuntime.PRECOMPILED_QNN_ONNX,
+    }
+    target_runtime = target_runtime_map[args.target_runtime]
+    
+    # Suppress warnings
+    warnings.filterwarnings("ignore")
+    
+    try:
+        export_result = export_quantized_model(
+            quantized_model_path=args.quantized_model,
+            device=args.device,
+            chipset=args.chipset,
+            skip_profiling=args.skip_profiling,
+            skip_inferencing=args.skip_inferencing,
+            skip_downloading=args.skip_downloading,
+            target_runtime=target_runtime,
+            output_dir=args.output_dir,
+            compile_options=args.compile_options,
+            profile_options=args.profile_options,
+        )
+        
+        logger.info("✅ Successfully exported quantized model to QAI Hub!")
+        
+        if export_result.compile_job:
+            logger.info(f"Compile job URL: {export_result.compile_job.url}")
+        if export_result.profile_job:
+            logger.info(f"Profile job URL: {export_result.profile_job.url}")
+        if export_result.inference_job:
+            logger.info(f"Inference job URL: {export_result.inference_job.url}")
+            
+    except Exception as e:
+        logger.error(f"❌ Export failed: {e}")
+        raise
+
 
 if __name__ == "__main__":
     main()
